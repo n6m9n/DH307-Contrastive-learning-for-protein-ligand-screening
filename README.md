@@ -19,6 +19,7 @@ complementarity, and that the late-interaction operator is largely not essential
 src/         experiment, analysis, and control scripts (run together, flat package)
 notebooks/   one-target end-to-end reproduction notebook + its generator
 paper/        the report (PDF + LaTeX source)
+presentation/ the slide deck
 results/      per-target result JSONs behind the report's tables
 ```
 
