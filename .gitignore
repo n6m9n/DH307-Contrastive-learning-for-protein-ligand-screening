@@ -1,0 +1,16 @@
+# data, checkpoints, results, build artifacts — code only
+*.lmdb
+*.pt
+*.pkl
+*.tgz
+*.mol2
+*.sdf
+*.pdb
+*.json
+*.log
+*.DONE
+*.png
+*.pdf
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
