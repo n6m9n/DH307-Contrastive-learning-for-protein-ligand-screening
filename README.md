@@ -18,6 +18,8 @@ complementarity, and that the late-interaction operator is largely not essential
 ```
 src/         experiment, analysis, and control scripts (run together, flat package)
 notebooks/   one-target end-to-end reproduction notebook + its generator
+paper/        the report (PDF + LaTeX source)
+results/      per-target result JSONs behind the report's tables
 ```
 
 The `src/` scripts are kept in one directory on purpose: several import from
@@ -83,6 +85,14 @@ python src/rerank_eval.py --user-dir ./unimol ./data --task drugclip --arch drug
 that preceded `rerank_eval.py`.
 
 ---
+
+## Result files (`results/`)
+Per-target JSONs behind the report's tables: `pocket_subst*.json` (specificity, DUD-E /
+LIT-PCBA, including the matched-mean `*_match` runs), `selectivity.json` (related-pocket
+test), `contact_permetrics.json` / `contact_typed_permetrics.json` / `conformer_contact.json`
+(contact recovery — geometric, typed PLIP, conformer), `plip_gt.json` (PLIP ground truth),
+`litpcba_permetrics.json` (LIT-PCBA LOO), `secondlayer.json` (second-layer baseline),
+`deploy_util.json` (deployment utility / scaffolds).
 
 ## Headline results
 - **DUD-E (20 held-out):** BEDROC +0.117, EF@0.5% +7.9 (paired-bootstrap significant, 18/20 and 14/20 targets).

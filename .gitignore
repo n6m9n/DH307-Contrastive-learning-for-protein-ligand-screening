@@ -14,3 +14,8 @@
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+
+# but keep the report and the result files
+!paper/*.pdf
+!paper/*.tex
+!results/*.json

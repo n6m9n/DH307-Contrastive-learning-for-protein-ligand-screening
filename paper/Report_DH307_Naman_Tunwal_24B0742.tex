@@ -1,0 +1,496 @@
+\documentclass[10pt,letterpaper,twocolumn]{article}
+\usepackage[margin=0.85in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{times}
+\usepackage[hidelinks]{hyperref}
+\usepackage{microtype}
+\usepackage{caption}
+\captionsetup{font=small,labelfont=bf}
+
+\setlength{\parskip}{0pt}
+\setlength{\columnsep}{0.26in}
+
+\title{\vspace{-2em}\bfseries Ligand-Side Gains from a Trained Projection of\\ Frozen DrugCLIP Atom Embeddings}
+\author{\normalsize DH307 Research Report \\ \normalsize Course project}
+\date{}
+
+\begin{document}
+\twocolumn[
+\begin{@twocolumnfalse}
+\maketitle
+\begin{abstract}
+\noindent
+DrugCLIP screens molecular libraries by encoding a protein pocket and a molecule into one pooled vector each and scoring the pair with a single dot product. The per-atom token representations its encoders compute are thrown away. We ask whether those tokens, recombined cheaply as a second stage, improve screening, and whether the atom--atom correspondences they induce carry any physical meaning. Our method adds a trained linear reprojection of the frozen per-atom tokens, using separate maps for pocket and ligand atoms, and combines a late-interaction (MaxSim) score with the original dot product. On 20 held-out DUD-E targets this raises early enrichment by 0.117 BEDROC and 7.9 EF@0.5\%, both significant under a paired bootstrap. A single shared map works about as well, so that choice is not important. Applying the same combination to raw, unprojected atoms instead \emph{lowers} enrichment, and does so at every candidate transformer layer, which tells us the gain comes from the trained reprojection and not from the atom embeddings by themselves. This untrained variant is a matched control inside our own MaxSim pipeline; it is not a reproduction of DrugCLIP's additive second-layer score, which its authors report as roughly neutral. We train the reprojection on DUD-E alone. Transferred to the debiased LIT-PCBA benchmark with the layer and mixing weight held fixed from DUD-E, the early-enrichment gain stays significant on EF@0.5\%; choosing those two hyperparameters per fold under leave-one-target-out cross-validation raises it to 0.023 BEDROC and 3.3 EF@0.5\%. Both are much smaller than on DUD-E, consistent with lower headroom on the less decoy-biased benchmark. Deployed as a cascade that reranks only DrugCLIP's top-$K$ shortlist, essentially the whole enrichment gain has appeared by $K \approx 1000$ at measured re-encode cost. The learned correspondences rank true physical contacts above chance: AUROC 0.56--0.60 for geometric 4\,\AA{} contacts and 0.53--0.58 for typed PLIP atom pairs, while raw embeddings stay near chance, and the association survives when the bound pose is replaced by a generated conformer. Finally, a specificity control sharpens the interpretation of the enrichment gain: on DUD-E a decoy pocket and a ligand-only head rerank about as well as the correct pocket, so the gain is predominantly ligand-side, and a mean over the same projected atoms matches the atom-wise maximum on DUD-E, so the late-interaction operator is largely not essential; only on debiased LIT-PCBA do small pocket-specific and operator components appear. We read the result as a trained linear projection of frozen atom tokens adding ligand-side early-enrichment signal, rather than as evidence of learned pocket--ligand complementarity or of the late-interaction operator itself.
+\end{abstract}
+\vspace{1.5em}
+\end{@twocolumnfalse}
+]
+
+\section{Introduction}
+
+Structure-based virtual screening ranks a large library of candidate molecules by their predicted ability to bind a target protein pocket. DrugCLIP~\cite{drugclip} casts this as dense retrieval. Two frozen Uni-Mol~\cite{unimol} 3D transformers encode the pocket and the molecule into one pooled embedding each, and the binding score is a single dot product, following the contrastive image--text recipe of CLIP~\cite{clip}. Every molecule embedding can be precomputed once, so this bi-encoder design screens enormous libraries quickly.
+
+That scale comes at a cost. The encoder computes a representation for every atom, but the score reads only a single global \texttt{[CLS]} vector per tower, so the individual atom tokens never enter the pooled similarity. Binding is a set of local atom--atom interactions: a hydrogen bond here, a hydrophobic contact there. One global vector per side can encode some of this implicitly. What it cannot do is score atom-level correspondences or expose them, and those correspondences are much of what separates a binder from a decoy. A full cross-encoder that attends over all pocket--ligand atom pairs models them explicitly, but it is far too slow to screen billions of molecules.
+
+We study a middle ground: a cheap second stage that reuses the discarded per-atom tokens to rerank only a shortlist, leaving the fast bi-encoder alone. MaxSim, the late-interaction operator from information retrieval~\cite{colbert,colbertv2}, fits well. For each ligand atom it takes the maximum similarity to any pocket atom, then averages those maxima, which gives a fine-grained score without joint attention.
+
+The difficulty is that the frozen atom tokens were shaped to support a single pooled \texttt{[CLS]} score. They were never asked to be compared pairwise across the two towers. Matching them naively should not be expected to help, and indeed DrugCLIP's own attempt to add raw atom embeddings to the global score was mixed to negative~\cite{drugclip}.
+
+One trained reprojection of the tokens turns out to be enough to change this. Placed on the per-atom tokens before MaxSim and combined additively with the pooled dot product, it moves the per-atom score from harmful to a consistent early-enrichment gain.
+
+We make six claims, and give each an explicit control and an uncertainty estimate. First, the reranker raises early enrichment on held-out DUD-E. Second, the trained reprojection is what does the work: raw atoms in the identical combination lower enrichment, including in a matched control that mirrors DrugCLIP's untrained second-layer score at every layer. Third, with the reprojection trained only on DUD-E, the gain transfers to the debiased LIT-PCBA benchmark; it is significant with the operating point fixed from DUD-E, and larger when the layer and mixing weight are selected per fold under leave-one-target-out cross-validation. Fourth, run as a top-$K$ cascade it captures essentially all of the enrichment gain at deployment-realistic cost, bounded by the retrieval Recall@$K$ ceiling, and the actives it adds are scaffold-diverse. Fifth, the learned correspondences rank true geometric and typed physical contacts above chance, this result disappears when the reprojection is removed, and it survives replacing the bound pose with a generated conformer. Sixth, a specificity control --- substituting decoy pockets, a ligand-only head, and a matched mean head --- shows the enrichment gain is predominantly ligand-side and that neither the pocket nor the atom-wise maximum of late interaction is essential to it on DUD-E, with only small pocket-specific and operator components on debiased data. Where outcomes are negative or mixed we treat them as scope constraints on the claims, and we state what the evidence does not establish.
+
+\section{Related Work}
+
+\paragraph{Bi-encoders for screening.} DrugCLIP~\cite{drugclip} aligns pocket and molecule representations contrastively and screens by pooled-embedding similarity, inheriting Uni-Mol~\cite{unimol} encoders and the CLIP~\cite{clip} objective. Precomputation and scale are its strengths. Its limitation is that the pooled similarity neither scores nor exposes which atoms interact. DrugCLIP touches atom-level information in two separate ways: it trains a fine-grained atom-interaction objective during pretraining (its App.~B.2), and, separately, at inference it tests augmenting the global score with raw second-layer atom embeddings, which it reports as layer-sensitive and roughly neutral, leaving the token-layer choice as future work (App.~C.2). Our contribution is distinct from both: a separate reranking head fit on top of the frozen encoders, with the B.2 atom objective inherited in the checkpoint rather than re-run. That inference-time, token-layer gap is what we study.
+
+\paragraph{Cross-encoders.} A cross-encoder jointly attends over pocket and ligand atoms, models their interactions explicitly, and is usually more accurate than a bi-encoder. Its per-pair cost rules out full-library screening. Our method is weaker by design: no cross-attention, and reranking confined to a shortlist, which trades accuracy for the bi-encoder's throughput. A cross-encoder is the natural accuracy upper bound for our comparison. We have not run one.
+
+\paragraph{Docking with learned rescoring.} Structure-based docking forms a separate comparison class, generating and scoring explicit poses. GNINA~\cite{gnina} is a docking pipeline that scores docked poses with a convolutional neural network, reasoning over an actual placed 3D complex instead of two independently encoded towers. Pose-based rescoring is both more expensive and more physically explicit than our late-interaction step, so it is a complementary baseline and not the same kind of model.
+
+\paragraph{Late interaction.} MaxSim late interaction was introduced for passage retrieval by ColBERT~\cite{colbert,colbertv2}, which keeps per-token embeddings and scores a query--document pair by summing per-query maxima. We port the operator to 3D protein--ligand matching and add a trained projection that adapts the frozen atom embeddings for token-level best-match scoring.
+
+\paragraph{Benchmarks and metrics.} DUD-E~\cite{dude} is a standard benchmark, but a decoy-biased one. LIT-PCBA~\cite{litpcba} was constructed to reduce chemical bias, with realistic hit rates and near-random bi-encoder performance by design, which makes it a stronger external test. We call it debiased and not unbiased: a recent audit documents residual train/validation redundancy and leakage in LIT-PCBA~\cite{litpcbaaudit}, so it reduces the bias DUD-E is known for without eliminating it. We measure early recognition with BEDROC~\cite{bedroc} and enrichment factors, and physical plausibility with PLIP~\cite{plip} typed-interaction profiling.
+
+\section{Method}
+
+\paragraph{Setup and notation.} Both DrugCLIP encoders stay frozen. For a pocket with atom tokens $\{p_j\}_{j=1}^{M}$ and a molecule with atom tokens $\{l_i\}_{i=1}^{N}$ taken from transformer layer $\ell$, DrugCLIP scores the pair by the dot product $s_{\text{dot}}$ of the two pooled (CLS) embeddings. We add a second score computed from the per-atom tokens.
+
+\paragraph{Trained projection.} Each per-atom token is reprojected with a trained linear map $\mathbb{R}^{512} \to \mathbb{R}^{128}$ and $L_2$-normalised. By default, and for all headline numbers, we use two maps: $W_p$ for pocket atoms and $W_l$ for ligand atoms. A single shared map performs comparably (Table~\ref{tab:main}), so that decision does not carry the result. These maps hold the only trained parameters in the method. Their job is to move the frozen embeddings, which were shaped for a single pooled \texttt{[CLS]} score, into a space where per-atom cosine similarity means something for best-match comparison across the two towers.
+
+\paragraph{MaxSim late interaction.} With $\hat{l}_i = \mathrm{norm}(W_l l_i)$ and $\hat{p}_j = \mathrm{norm}(W_p p_j)$, the late-interaction score is the mean of per-ligand-atom maxima,
+\begin{equation}
+s_{\max} = \frac{1}{N}\sum_{i=1}^{N} \max_{1 \le j \le M} \hat{l}_i^{\top} \hat{p}_j .
+\end{equation}
+Every ligand atom is assigned its single most similar pocket atom. This is a best-match assignment and not a one-to-one matching: the maxima are taken independently per ligand atom, so one pocket atom can be the best match for several ligand atoms. We call these arg-max pairs the token correspondences, and test them against physical contacts in Section~\ref{sec:contacts}.
+
+\paragraph{Combination.} MaxSim on its own is weaker than the dot at the very top of the ranking, but it is orthogonal to it. We therefore combine the two additively after z-scoring each across the scored set,
+\begin{equation}
+s = z(s_{\text{dot}}) + \alpha\, z(s_{\max}),
+\end{equation}
+with $\alpha$ and the token layer $\ell$ chosen on a validation split only. The z-scoring stops either term from dominating through scale alone.
+
+\paragraph{Training.} We train $W$ with an InfoNCE objective over actives versus decoys per target. Hard-negative mining, the number of projections and the projection dimension are all ablated in Section~\ref{sec:results} and turn out not to be critical.
+
+\paragraph{Deployment as a cascade.} At deployment, DrugCLIP's dot ranks the full library (Stage 1). Only the top-$K$ shortlist is re-encoded and reranked by $s$ (Stage 2); molecules below rank $K$ keep their dot order. Stage 2 can reorder within the shortlist but cannot promote an active from below $K$, so Stage-1 Recall@$K$ is a hard ceiling on end-to-end recovery. Storing per-atom tokens for a whole library is impractical (Section~\ref{sec:cost}), which is why Stage 2 re-encodes the shortlist instead of caching atoms.
+
+\section{Experimental Setup}
+
+\paragraph{Data and splits.} We train $W$ on 60 DUD-E~\cite{dude} targets, validate on 10, and test on 20 held-out targets, using a disjoint and fixed alphabetical split. The external benchmark is all 15 LIT-PCBA~\cite{litpcba} targets at full size, about 2.9M molecule instances. $W$ sees no LIT-PCBA data of any kind.
+
+\paragraph{Metrics.} We report BEDROC with $\alpha = 80.5$~\cite{bedroc} and the enrichment factors EF@0.5\% and EF@1\%. All are higher-is-better. Uncertainty is a paired bootstrap over targets with 10k resamples. A $^{*}$ marks a 95\% CI on the paired per-target difference against the dot baseline that excludes 0, and we also report how many targets improved.
+
+\paragraph{Reproducibility.} All results use the released frozen \texttt{checkpoint\_best.pt} encoder, and $W$ is trained with seed 1 unless noted. The dot baseline is deterministic and identical across tables. We compute the 2-seed headline on DUD-E in fp32. The cascade analysis uses an fp16 per-atom path, needed for memory on the large LIT-PCBA libraries, and it reproduces the headline within its confidence interval.
+
+\paragraph{Reproducibility details.} The 102 DUD-E targets are sorted alphabetically and split by index: test $[0{:}20]$, validation $[20{:}30]$, train $[30{:}90]$. The split uses 90 of the 102; the remaining 12 (sahh, src, tgfr1, thb, thrb, try1, tryb1, tysy, urok, vgfr2, wee1, xiap) are the alphabetical remainder beyond index 90, held out of every split and not evaluated. The full per-split lists are in Appendix~\ref{app:splits}, with per-target specificity numbers in Appendix~\ref{app:pertarget}. LIT-PCBA is the \texttt{full\_data} release from the Rognan group; for each target we use the alphabetically-first holo structure as the pocket template (for example 3p0g for ADRB2, 2vuk for TP53, 1fap for MTORC1) and build a 6\,\AA{} pocket around its co-crystallized ligand. A single fixed template per target is a simplification; we did not ensemble over the multiple structures available. The frozen encoder is the released \texttt{checkpoint\_best.pt} (file dated 2024-01-23 in our copy). DrugCLIP is pretrained on PDBBind~2019, BioLiP and ChEMBL pairs; the public repository distributes the training data, the trained checkpoint, and the DUD-E test data, together with FLAPP-based train/validation split files at sequence-identity thresholds 0.6 and 0.9. It does not document a precise procedure for excluding our evaluation targets from pretraining that we could verify. We used the released checkpoint as distributed, without confirming how DUD-E or LIT-PCBA overlap was handled in its pretraining, and without re-auditing that overlap ourselves (see Limitations).
+
+\paragraph{Control and training protocol.} All heads train with InfoNCE: per step one active against 32 hard negatives --- the top 32 by the current score among 96 sampled decoys, from a cache of 800 decoys per target --- temperature 0.05, AdamW at learning rate $10^{-3}$ and weight decay $10^{-2}$, 4000 steps, projection dimension 128, dropout 0.1. For the pocket-substitution control (Table~\ref{tab:specificity}) we sample 3 decoy pockets per target on DUD-E and 2 on LIT-PCBA and average their per-molecule MaxSim scores before $z$-scoring and combining; because this averaging lowers the variance of the decoy arm relative to the single correct-pocket arm, the related-protein selectivity test uses a single off-target pocket and no averaging. The mean heads share the trained projection with MaxSim: the matched mean head applies the identical per-atom $L_2$ normalization and replaces only the atom-wise maximum over pocket atoms with a mean (so the two differ only in that aggregation), which is the clean operator ablation; a simpler mean-pooled head that pools the projected atoms before normalizing gives a similar reading. The conformer test (Section~\ref{sec:contacts}) uses a single ETKDGv3 conformer per ligand, MMFF-optimized, with seed 1.
+
+\section{Results}
+\label{sec:results}
+
+\begin{table}[t]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\caption{Main result and ablations on 20 held-out DUD-E targets. $\Delta$ is versus the dot baseline (BEDROC 0.452, EF@0.5\% 37.73); $^{*}$ = paired-bootstrap 95\% CI excludes 0. Layer 12 for the headline; ablations at layer 15, where the dot baseline and the trained map are both stable and the ablation sweep was run.}
+\label{tab:main}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Configuration & $\Delta$BEDROC & $\Delta$EF@0.5\% \\
+\midrule
+dot$+0.5$\,maxsim (ours) & $+0.117^{*}$ & $+7.86^{*}$ \\
+\quad targets improved & 18/20 & 14/20 \\
+\midrule
+\multicolumn{3}{@{}l}{\emph{Ablations (layer 15, $\Delta$ vs dot)}} \\
+Random negatives & $+0.107^{*}$ & $+7.59^{*}$ \\
+One shared $W$ & $+0.104^{*}$ & $+7.25^{*}$ \\
+Projection dim 64 / 256 & $+0.106^{*}$ / $+0.104^{*}$ & $+6.58^{*}$ / $+6.83^{*}$ \\
+Raw atoms, no $W$ & $-0.059^{*}$ & $-5.62^{*}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Reranking improves early enrichment on held-out DUD-E}
+
+Table~\ref{tab:main} reports the main comparison. At the validation-selected layer 12, $s = z(s_{\text{dot}}) + 0.5\,z(s_{\max})$ raises mean BEDROC from 0.452 to 0.569, a gain of $+0.117$ with 95\% CI $[+0.077, +0.160]$ on 18 of 20 targets. EF@0.5\% rises from 37.7 to 45.6, a gain of $+7.86$ with 95\% CI $[+4.13, +11.72]$ on 14 of 20. The effect reproduces across two training seeds. MaxSim on its own underperforms the dot at the top of the ranking, so the gain comes from the combination and not from either term alone.
+
+\subsection{The role of the trained reprojection}
+
+The lower half of Table~\ref{tab:main} reports the key control. Dropping raw atom cosines into the identical combination, with no $W$, lowers enrichment: $-0.059$ BEDROC and $-5.6$ EF@0.5\%, winning on only 3--5 of 20 targets. The same per-atom tokens therefore help only once they have been reprojected, which isolates the effect of training the map from the effect of adding atom information at all.
+
+Robustness ablations cover random versus hard negatives, one versus two projection maps, and projection dimensions of 64, 128 and 256. All land between $+0.10$ and $+0.11$ BEDROC, so the method is not finely tuned. In particular the single shared map matches the two-map default we use for the headline.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Second-layer baseline across layers (20 held-out DUD-E targets), $\Delta$BEDROC vs dot. ``raw'' is DrugCLIP-style untrained atom embeddings; ``$W$'' is the trained projection. $^{*}$ = paired-bootstrap 95\% CI excludes 0, which holds for every entry in both columns.}
+\label{tab:layers}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Layer & $\Delta$ raw (untrained) & $\Delta$ $W$ (ours) \\
+\midrule
+15 (final) & $-0.059^{*}$ & $+0.108^{*}$ \\
+14 & $-0.059^{*}$ & $+0.102^{*}$ \\
+13 & $-0.054^{*}$ & $+0.125^{*}$ \\
+12 (selected) & $-0.070^{*}$ & $+0.117^{*}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Trained versus untrained tokens in a matched pipeline}
+
+DrugCLIP's own variant adds untrained atom embeddings to the score. Our ``raw, no $W$'' configuration is a matched control inside our MaxSim pipeline: same mean-of-max aggregation, same z-scored combination, untrained tokens. It is not a reproduction of DrugCLIP's additive second-layer score, which aggregates and normalises differently. DrugCLIP's paper reports its variant as roughly neutral, whereas our untrained control lowers enrichment at every layer, from $-0.054$ to $-0.070$ BEDROC, and the trained projection raises it at every layer, from $+0.102$ to $+0.125$ (Table~\ref{tab:layers}).
+
+We read this result within our own pipeline. Adding untrained atom tokens to the late-interaction score does not help here, and training the reprojection is what makes those tokens useful. Given the differing aggregation and normalisation, we do not claim this contradicts DrugCLIP's measurement.
+
+\begin{table}[t]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\caption{LIT-PCBA transfer under LOO-CV ($n = 15$), $W$ trained on DUD-E only. $\Delta$ vs dot; $^{*}$ = 95\% CI excludes 0.}
+\label{tab:litpcba}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Quantity & $\Delta$ vs dot & 95\% CI & up \\
+\midrule
+BEDROC & $+0.0233^{*}$ & $[+0.007, +0.042]$ & 12/15 \\
+EF@0.5\% & $+3.34^{*}$ & $[+1.19, +5.90]$ & 8/15 \\
+Raw, no $W$ (BEDROC) & $-0.0082^{*}$ & $[-0.014, -0.003]$ & 4/15 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{External validity: transfer to debiased LIT-PCBA}
+
+The sharpest risk to our DUD-E result is that it exploits decoy bias. $W$ is trained on DUD-E only and never sees LIT-PCBA data, and we evaluate on all 15 debiased LIT-PCBA targets at full size. We separate two evaluation modes, because they tune different numbers of hyperparameters on LIT-PCBA.
+
+\paragraph{Fixed operating point (zero-shot).} With the token layer and mixing weight $\alpha$ fixed from DUD-E validation, and nothing selected on LIT-PCBA, the transfer is significant: BEDROC $+0.0156$, 95\% CI $[+0.0065, +0.0253]$, 11 of 15 targets. This is the fully zero-shot number, since neither $W$ nor the operating point used any LIT-PCBA information.
+
+\paragraph{Cross-validated operating point.} A single 7-target held-out split is underpowered, so we also report leave-one-target-out cross-validation. Each target is held out in turn, and the layer and $\alpha$ are selected on the mean BEDROC of the other 14 LIT-PCBA targets (Table~\ref{tab:litpcba}). This selects two hyperparameters on LIT-PCBA targets, which makes it a cross-validated held-out-target result and not a fully fixed zero-shot evaluation. It raises the estimate to BEDROC $+0.0233^{*}$ and EF@0.5\% $+3.34^{*}$, and the selected operating point is stable, with 13 of 15 folds picking the same setting. Raw-without-$W$ again lowers enrichment in both modes.
+
+The magnitude is far smaller than on DUD-E. That is consistent with LIT-PCBA's near-random bi-encoder signal, where the dot alone reaches BEDROC 0.049, and with the residual redundancy the audit~\cite{litpcbaaudit} documents. Part of the DUD-E headroom is decoy bias; a smaller component, which depends on the reprojection, survives on cleaned data.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Top-$K$ deployment cascade on DUD-E (layer 12). Recall@$K$ is the Stage-1 ceiling; $\Delta$ vs dot, $^{*}$ = CI excludes 0.}
+\label{tab:cascade}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+$K$ & Recall@$K$ & $\Delta$BEDROC & $\Delta$EF@0.5\% \\
+\midrule
+50 & 0.17 & $+0.001$ & $-0.08$ \\
+100 & 0.25 & $+0.008^{*}$ & $+2.48^{*}$ \\
+200 & 0.33 & $+0.023^{*}$ & $+4.72^{*}$ \\
+1000 & 0.54 & $+0.075^{*}$ & $+5.79^{*}$ \\
+all & 1.00 & $+0.101^{*}$ & $+5.83^{*}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Deployment regime and cost}
+\label{sec:cost}
+
+The method's real use is a cascade that reranks only DrugCLIP's top-$K$ shortlist. Table~\ref{tab:cascade} sweeps $K$ on DUD-E. EF@0.5\%, the screening-relevant metric, becomes significant by $K = 100$ and reaches 99\% of its full value by $K = 1000$, so reranking the whole library is unnecessary. Stage-1 Recall@$K$, which is 0.54 at $K = 1000$, bounds end-to-end recovery of actives that Stage 1 missed. It does not bound early enrichment, because the top-ranked actives are already inside the shortlist.
+
+The MaxSim operation itself is near-free at 0.013 ms per molecule. The real cost is re-encoding the shortlist, at 1.29 ms per molecule, or roughly 1.3 s per target at $K = 1000$. Storing per-atom tokens for a 500M-compound library would be impractical: 27.5 TB, against 0.26 TB for pooled vectors.
+
+Repeating the cascade on LIT-PCBA with everything fixed from DUD-E, the early-enrichment gain transfers, with $\Delta$EF@0.5\% $+0.93^{*}$ and $\Delta$EF@1\% $+1.21^{*}$ over the full set. Here it is Stage-1-recall-bounded: the larger, near-random libraries place only about 10\% of actives in the top-1000.
+
+\begin{table}[t]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\caption{Deployment utility on 20 held-out DUD-E targets: mean actives and distinct Bemis--Murcko active scaffolds in the top 50 / 100, DrugCLIP dot vs reranked (dot$+0.5$\,maxsim), with the paired gain. The shortlist (top-1000 by dot) holds 133 actives per target on average, of about 258 total; the mean of the per-target recall ratios is 0.54 (Table~\ref{tab:cascade}), which differs from $133/258$ because it averages ratios rather than taking a ratio of means. Per-target values are in Appendix~\ref{app:deploy}. $^{*}$ = CI excludes 0.}
+\label{tab:utility}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+ & top-50: dot/rr ($\Delta$) & top-100: dot/rr ($\Delta$) \\
+\midrule
+actives & $29.1/34.2$ ($+5.1^{*}$) & $48.6/58.1$ ($+9.5^{*}$) \\
+scaffolds & $28.4/33.5$ ($+5.1^{*}$) & $47.2/56.5$ ($+9.3^{*}$) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Deployment utility.} The reranker adds roughly five actives in the top 50 and nine in the top 100 per target (Table~\ref{tab:utility}), and the added actives are scaffold-diverse: the number of distinct Bemis--Murcko scaffolds among the retrieved actives rises almost one for one, so the gain is not the duplication of a single chemotype.
+
+\begin{table}[t]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\caption{Pocket-substitution specificity control, BEDROC. Rerank the shortlist with the correct pocket, size- and composition-matched decoy pockets, a ligand-only head (no pocket), and a matched mean head (identical projection and per-atom normalization to MaxSim, the atom-wise max replaced by a mean); layer and $\alpha$ fixed from DUD-E. DUD-E reranks the top-1000 shortlist and scores BEDROC \emph{within} that shortlist (hence the higher dot baseline, 0.669, than the full-library 0.452 of Table~\ref{tab:main}); LIT-PCBA reranks the full library. Contrast rows are paired per-target means at full precision; small differences from the rounded column entries are rounding. $^{*}$ = CI excludes 0.}
+\label{tab:specificity}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Head & DUD-E & LIT-PCBA \\
+\midrule
+dot (baseline) & 0.669 & 0.049 \\
+correct pocket & 0.731 & 0.068 \\
+decoy pocket & 0.724 & 0.062 \\
+ligand-only & 0.753 & 0.064 \\
+mean (matched) & 0.736 & 0.065 \\
+\midrule
+correct $-$ decoy & $+0.006$ & $+0.007$ \\
+correct $-$ ligand-only & $-0.023^{*}$ & $+0.004$ \\
+correct $-$ mean (matched) & $-0.005$ & $+0.003^{*}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Is the reranking gain pocket-specific?}
+\label{sec:specificity}
+
+A gain in early enrichment does not by itself show the reranker uses the pocket. On DUD-E, ligand features alone separate many actives from decoys~\cite{chen}, so a reranker can improve enrichment without pocket--ligand complementarity. We test this with a specificity control: keep DrugCLIP's shortlist and dot scores fixed, and rerank with (i) the correct pocket, (ii) several decoy pockets from other targets matched on heavy-atom count and element composition, (iii) a ligand-only head trained with a global query over ligand atoms and no pocket, and (iv) a matched mean head that shares MaxSim's projection and per-atom normalization and replaces only the atom-wise maximum over pocket atoms with a mean. All heads train on the same DUD-E targets; the layer and $\alpha$ are fixed.
+
+On DUD-E the gain is not pocket-specific (Table~\ref{tab:specificity}). A decoy pocket reranks as well as the correct one (correct $-$ decoy BEDROC $+0.006$, CI includes 0), and the ligand-only head does better than the correct pocket --- a paired advantage of $1.6$ actives in the top 50 and $+0.023$ BEDROC, both CIs excluding 0. On DUD-E the improvement is therefore ligand-side, consistent with the benchmark's decoy bias.
+
+The mean head narrows the mechanism further. We use a control matched to MaxSim in everything but the aggregation --- identical projection, identical per-atom $L_2$ normalization, the atom-wise maximum over pocket atoms replaced by a mean. On DUD-E it ties the maximum (BEDROC 0.736 vs 0.731; correct $-$ matched-mean $-0.005$, CI includes 0), so on the decoy-biased benchmark the maximum --- the defining operation of late interaction --- is not what produces the gain. On debiased LIT-PCBA the maximum retains a small but significant edge over the matched mean (correct $-$ matched-mean $+0.003$, CI excludes 0). That is about a sixth of the $0.019$ BEDROC enrichment available over the dot on this cleaned benchmark --- not a rounding artifact --- and it is consistent in direction: the maximum beats the matched mean on 9 of 15 targets, loses on 4 and ties on 2. The magnitude is concentrated, though: four targets (VDR, TP53, MTORC1, MAPK1) account for most of it, and removing them preserves the sign but not the size. What survives both controls is a narrower claim than the late-interaction framing suggests: a \emph{trained linear projection of the frozen per-atom tokens} adds ligand-side early-enrichment signal, while the pocket and the late-interaction operator contribute little, and only on debiased data at that.
+
+On debiased LIT-PCBA, evaluated over the full library where power is adequate, a faint and tentative pocket-specific signal appears. The only significant result is the top-100 actives contrast (correct minus decoy $+0.40$ actives, CI excludes 0); the BEDROC differences are not significant (correct minus decoy $+0.007$, correct minus ligand-only $+0.008$, both CIs include or barely include 0). We read this as suggestive rather than established: the pocket contributes at most a small part of the already-small LIT-PCBA gain. Across both benchmarks the reranker's enrichment is predominantly ligand-side, with at most a faint pocket-specific component that surfaces only once decoy bias is removed.
+
+\paragraph{Selectivity between related pockets.} A stronger version of the control asks whether the reranker can tell apart two \emph{related} proteins, the setting where selectivity matters. This follow-up was gated on the correct-pocket advantage holding on LIT-PCBA, which it does only marginally ($+0.007$ BEDROC, reaching significance on the top-100 actives contrast alone); we ran it regardless. On four held-out related pairs (AKT1/AKT2, ADRB1/ADRB2, CYP2C9/CYP3A4, trypsin/tryptase; 8 targets, none in $W$'s training), we enrich each target's own actives with its cognate pocket versus its related partner's pocket. Two of the pairs' targets, CYP2C9 and CYP3A4, fall in the validation slice where the layer and $\alpha$ were chosen, so their operating point is not fully clean, though $W$ never trained on them. The cognate pocket holds no advantage: cognate minus off-target BEDROC is $+0.011$ (CI $[-0.008, +0.033]$, includes 0) and the per-target gains are a wash, while the ligand-only head again does best, beating the cognate pocket on actives in the top 50. The reranker therefore does not discriminate even closely related pockets. A full selectivity test --- compounds with measured activity against two related proteins, asking whether the score favours the more active target --- needs cross-activity assay data we do not have, and remains future work.
+
+\subsection{Do the correspondences predict physical contacts?}
+\label{sec:contacts}
+
+We test whether MaxSim's arg-max correspondences land on real contacts, using 35 held-out holo complexes, 20 from DUD-E and 15 from LIT-PCBA, none of them in $W$'s training. We encode each crystal pocket with its own bound crystal ligand, project through $W$, and for each contacting ligand atom measure whether the learned per-atom similarities rank its true partners at the top. We compare against a raw-embedding baseline and against chance.
+
+\paragraph{Geometric contacts.} With a 4\,\AA{} crystal-distance ground truth (Table~\ref{tab:contacts}), $W$ ranks true contacts above chance at AUROC 0.56--0.60, and the top-matching pocket atom is a real contact 4--5$\times$ more often than random. Raw embeddings sit at or below chance, 0.43--0.49. The $W$-versus-raw and $W$-versus-random differences are bootstrap-significant on both benchmarks.
+
+\begin{table}[t]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{2.5pt}
+\caption{Contact recovery over 35 held-out holo complexes. AUROC and top-1 hit rate for the learned ($W$) versus raw embeddings. The final column is the chance top-1 rate for that ground truth, lower for the typed set because it is sparser. $^{*}$ = paired-bootstrap CI over complexes excludes 0.}
+\label{tab:contacts}
+\begin{tabular}{@{}llcccc@{}}
+\toprule
+Ground truth & Layer & AUROC $W$ & AUROC raw & top-1 $W$ & rand. \\
+\midrule
+Geom. 4\,\AA{} & 12 & $0.563^{*}$ & 0.428 & $0.070^{*}$ & 0.015 \\
+Geom. 4\,\AA{} & 15 & $0.603^{*}$ & 0.486 & $0.062^{*}$ & 0.015 \\
+Typed (PLIP) & 12 & $0.528^{*}$ & 0.430 & $0.035^{*}$ & 0.006 \\
+Typed (PLIP) & 15 & $0.579^{*}$ & 0.500 & $0.030^{*}$ & 0.006 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Typed interactions.} We repeat the test with PLIP~\cite{plip} typed interactions as ground truth. PLIP's coordinates are the genuine interacting atoms only for atom-level types: hydrophobic, hydrogen bond and halogen. For group-level types, meaning $\pi$-stacking, $\pi$-cation and salt bridge, they are ring or charge-group centroids, and water bridges are water-mediated. We therefore define the metric strictly, as atom-pair recovery over the 299 atom-level interactions, which map onto encoder tokens exactly, with a maximum residual of 0.00\,\AA{} so that each token pair is precisely the atom pair PLIP identified. The 37 group-level and 3 water interactions are reported separately.
+
+On this sparser and stricter target the learned correspondences still rank typed partners above the untrained baseline and above chance, at AUROC 0.53--0.58 with top-1 around 5$\times$ random. That is lower than the geometric result, as expected. These are modest associations and not contact prediction: AUROC near 0.6 is a long way from a contact predictor, which is the ceiling we would expect for two towers encoded independently with no shared geometry. What the test establishes is narrow but concrete. The matching is above baseline, and it disappears without the reprojection, so it reflects some real, learned geometric structure and not only decoy statistics.
+
+\paragraph{Robustness to the ligand conformation.} The test so far encodes the ligand in its bound crystal pose, which is unavailable in screening. We repeat it with an RDKit ETKDG-generated conformer of each ligand (32 of 35 complexes, the rest failing to parse or embed), keep the crystal contacts as labels, and compare against an element-based donor/acceptor and hydrophobic compatibility baseline. The association survives: $W$ on a generated conformer recovers crystal contacts about as well as on the crystal pose (AUROC 0.56 at layer 12 and 0.61 at layer 15, against 0.56 and 0.60 for the crystal pose), and beats both the raw-embedding ablation and the chemistry baseline on both benchmarks (W $-$ chem $+0.06$ at layer 12 and $+0.12$ at layer 15, CIs exclude 0). The correspondences thus reflect learned, largely conformation-invariant chemical patterns rather than the exact bound geometry.
+
+\paragraph{What this does and does not show.} The specificity control (Section~\ref{sec:specificity}) qualifies these contact results. The correspondences carry real, conformation-robust contact information, but that geometric signal is not the main driver of the screening gain, which is largely ligand-side. The two findings are consistent: the reprojection learns chemical atom-type patterns that align with contacts and survive conformer perturbation, yet are not pocket-specific enough to explain the enrichment.
+
+\section{Limitations}
+
+Our evidence bounds the claims as follows.
+
+The DUD-E gain is partly decoy bias, and the component that transfers to debiased LIT-PCBA is small. Its size also depends on the evaluation. With the operating point fixed from DUD-E the BEDROC transfer is significant but small at $+0.0156$, and within the specific top-$K$ cascade at the fixed layer the BEDROC change is only directional, reaching significance under the LOO-CV that selects the layer and $\alpha$ on LIT-PCBA targets.
+
+The specificity control localizes this. On DUD-E the gain is reproduced by a decoy pocket and by a ligand-only head, so it is largely not pocket-specific; a faint pocket-specific component appears only on debiased LIT-PCBA. The method should therefore be read as adding ligand-side early-enrichment signal, not as evidence of learned pocket--ligand complementarity. Distinguishing a genuine pocket contribution on cleaned data, at adequate power, is the clearest open question.
+
+The cascade's end-to-end recovery is capped by DrugCLIP's Stage-1 recall. On large debiased libraries that recall, and not the reranker, is the binding constraint.
+
+Contact recovery is a modest association above baseline, with AUROC around 0.6 geometric and 0.55 typed, which is what we would expect for independent towers. It is not a contact predictor. Group-level and water-mediated interactions are reported separately and not as atom pairs.
+
+We have not run external cross-encoder or docking-rescoring baselines. Neither a jointly-attending cross-encoder as an accuracy upper bound, nor pose-based rescoring such as GNINA~\cite{gnina}. The comparison here is to DrugCLIP and to the untrained-token control inside our own pipeline.
+
+Finally, our splits hold the evaluation targets out of the reranker training, but the frozen DrugCLIP checkpoint was pretrained on a large corpus of pocket--ligand pairs that may include targets or compounds related to our DUD-E and LIT-PCBA evaluation sets. We did not audit this overlap. Part of the absolute performance, of the dot baseline as much as of our reranker, could therefore reflect familiarity acquired during pretraining rather than generalization to genuinely novel targets. Our paired comparisons control for this only insofar as both sides share the same frozen encoder. The debiased LIT-PCBA transfer reduces the concern without removing it, and the LIT-PCBA audit~\cite{litpcbaaudit} notes residual redundancy in that benchmark too. These are the natural next experiments.
+
+\section{Conclusion}
+
+A lightweight trained reprojection turns DrugCLIP's discarded per-atom tokens into a cheap late-interaction reranker. It raises early enrichment on held-out DUD-E, and the gain transfers to debiased LIT-PCBA, smaller there: significantly so with the operating point fixed from DUD-E, and more so when the two hyperparameters are cross-validated on LIT-PCBA targets. Inside our pipeline the untrained-token control lowers enrichment at every layer, so training the map is what makes the tokens useful. Applied only to a shortlist, the reranker captures essentially all of its DUD-E benefit at a measured re-encode cost. The learned correspondences rank true geometric and typed physical contacts above chance, and that ranking vanishes once the reprojection is removed.
+
+A specificity control sharpens what that signal is. On DUD-E a decoy pocket and a ligand-only head rerank about as well as the correct pocket, so the enrichment gain is predominantly ligand-side; only on debiased LIT-PCBA does a faint pocket-specific component appear. Separately, the learned correspondences recover physical contacts above chance and keep doing so from a generated conformer, but that geometry is not what drives the screening gain.
+
+A trained linear projection of the frozen per-atom tokens therefore adds a small, real and transferable early-enrichment signal on top of a strong bi-encoder --- but the controls localize what that signal is not. It is largely ligand-side rather than pocket-specific, and on DUD-E a matched mean over the projected atoms reproduces it, so the late-interaction operator is largely not essential there --- though on debiased data it keeps a small but real edge, about a sixth of the enrichment and consistent in sign across targets. That is enough to motivate the next steps --- distance-aware matching that forces the pocket into the score, and a cross-encoder upper bound --- while being honest that, here, neither pocket complementarity nor the late-interaction operator is what carries the gain.
+
+\paragraph{Reproducibility note.} All numbers are frozen from the project's verified runs, with a frozen encoder and $W$ at seed 1, and are traced in an accompanying evidence file. External baselines and a distance-decay analysis remain future work.
+
+\appendix
+
+\section{DUD-E target splits}
+\label{app:splits}
+The 102 DUD-E targets, sorted alphabetically and split by index.
+\emph{Test} [0:20]: aa2ar, abl1, ace, aces, ada, ada17, adrb1, adrb2, akt1, akt2, aldr, ampc, andr, aofb, bace1, braf, cah2, casp3, cdk2, comt.
+\emph{Validation} [20:30]: cp2c9, cp3a4, csf1r, cxcr4, def, dhi1, dpp4, drd3, dyr, egfr.
+\emph{Train} [30:90]: esr1, esr2, fa10, fa7, fabp4, fak1, fgfr1, fkb1a, fnta, fpps, gcr, glcm, gria2, grik1, hdac2, hdac8, hivint, hivpr, hivrt, hmdh, hs90a, hxk4, igf1r, inha, ital, jak2, kif11, kit, kith, kpcb, lck, lkha4, mapk2, mcr, met, mk01, mk10, mk14, mmp13, mp2k1, nos1, nram, pa2ga, parp1, pde5a, pgh1, pgh2, plk1, pnph, ppara, ppard, pparg, prgr, ptn1, pur2, pygm, pyrd, reni, rock1.
+\emph{Unused} [90:102]: sahh, src, tgfr1, thb, thrb, try1, tryb1, tysy, urok, vgfr2, wee1, xiap.
+
+\section{Per-target specificity numbers}
+\label{app:pertarget}
+Per-target BEDROC for the specificity control (Table~\ref{tab:specificity}): DUD-E within the top-1000 shortlist, LIT-PCBA over the full library. ``cor''/``dec''/``lig''/``mm'' are the correct-pocket, decoy-pocket, ligand-only, and matched-mean heads.
+
+\begin{table}[h]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\caption{DUD-E (top-1000 shortlist), per-target BEDROC.}
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+target & dot & cor & dec & lig & mm \\
+\midrule
+aa2ar & 0.998 & 0.985 & 0.983 & 0.994 & 0.979 \\
+abl1 & 0.726 & 0.908 & 0.905 & 0.922 & 0.892 \\
+ace & 0.845 & 0.960 & 0.948 & 0.977 & 0.974 \\
+aces & 0.707 & 0.952 & 0.933 & 0.951 & 0.911 \\
+ada & 0.997 & 0.997 & 0.997 & 0.998 & 0.998 \\
+ada17 & 1.000 & 1.000 & 1.000 & 1.000 & 1.000 \\
+adrb1 & 0.681 & 0.730 & 0.749 & 0.848 & 0.766 \\
+adrb2 & 0.702 & 0.736 & 0.679 & 0.869 & 0.713 \\
+akt1 & 0.210 & 0.428 & 0.407 & 0.442 & 0.391 \\
+akt2 & 0.103 & 0.176 & 0.185 & 0.287 & 0.187 \\
+aldr & 0.003 & 0.002 & 0.001 & 0.005 & 0.003 \\
+ampc & 0.731 & 0.767 & 0.767 & 0.745 & 0.770 \\
+andr & 0.986 & 0.984 & 0.991 & 0.984 & 0.988 \\
+aofb & 0.061 & 0.100 & 0.075 & 0.092 & 0.112 \\
+bace1 & 0.995 & 1.000 & 1.000 & 1.000 & 0.999 \\
+braf & 0.964 & 0.963 & 0.957 & 0.968 & 0.967 \\
+cah2 & 0.329 & 0.328 & 0.362 & 0.300 & 0.341 \\
+casp3 & 0.434 & 0.659 & 0.609 & 0.749 & 0.801 \\
+cdk2 & 0.974 & 0.994 & 0.995 & 0.994 & 0.996 \\
+comt & 0.933 & 0.945 & 0.948 & 0.941 & 0.929 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\caption{LIT-PCBA (full library), per-target BEDROC.}
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+target & dot & cor & dec & lig & mm \\
+\midrule
+ADRB2 & 0.116 & 0.111 & 0.115 & 0.119 & 0.111 \\
+ALDH1 & 0.074 & 0.070 & 0.061 & 0.067 & 0.065 \\
+ESR1\_ago & 0.074 & 0.132 & 0.090 & 0.142 & 0.130 \\
+ESR1\_ant & 0.067 & 0.075 & 0.070 & 0.065 & 0.082 \\
+FEN1 & 0.025 & 0.047 & 0.060 & 0.074 & 0.049 \\
+GBA & 0.023 & 0.039 & 0.043 & 0.051 & 0.035 \\
+IDH1 & 0.005 & 0.010 & 0.017 & 0.011 & 0.016 \\
+KAT2A & 0.010 & 0.014 & 0.025 & 0.033 & 0.014 \\
+MAPK1 & 0.033 & 0.042 & 0.029 & 0.035 & 0.034 \\
+MTORC1 & 0.021 & 0.031 & 0.030 & 0.028 & 0.023 \\
+OPRK1 & 0.007 & 0.005 & 0.001 & 0.002 & 0.006 \\
+PKM2 & 0.013 & 0.013 & 0.014 & 0.016 & 0.011 \\
+PPARG & 0.240 & 0.331 & 0.260 & 0.255 & 0.324 \\
+TP53 & 0.000 & 0.065 & 0.069 & 0.027 & 0.055 \\
+VDR & 0.027 & 0.039 & 0.040 & 0.039 & 0.027 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Per-target deployment utility}
+\label{app:deploy}
+Per-target version of Table~\ref{tab:utility} on the 20 held-out DUD-E targets (dot vs reranked dot$+0.5$\,maxsim). Cells are dot/reranked: ``a@50''/``a@100'' are actives in the top 50/100; ``s@50''/``s@100'' are distinct Bemis--Murcko active scaffolds in the top 50/100. ``sh'' is actives in the top-1000 shortlist (the reranker ceiling) and ``tot'' the target's total actives.
+
+\begin{table}[h]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\caption{DUD-E per-target deployment utility.}
+\begin{tabular}{@{}lccccrr@{}}
+\toprule
+target & a@50 & a@100 & s@50 & s@100 & sh & tot \\
+\midrule
+aa2ar & 49/49 & 92/92 & 49/49 & 91/92 & 268 & 482 \\
+abl1 & 31/43 & 48/68 & 31/43 & 48/67 & 74 & 182 \\
+ace & 36/38 & 67/63 & 34/38 & 64/61 & 207 & 282 \\
+aces & 37/48 & 77/93 & 37/47 & 75/92 & 252 & 453 \\
+ada & 50/50 & 77/79 & 46/46 & 68/71 & 92 & 93 \\
+ada17 & 50/50 & 100/100 & 50/50 & 100/100 & 455 & 532 \\
+adrb1 & 27/40 & 45/53 & 24/37 & 42/49 & 119 & 247 \\
+adrb2 & 27/35 & 44/57 & 27/35 & 44/55 & 112 & 231 \\
+akt1 & 12/31 & 26/62 & 12/30 & 26/61 & 116 & 293 \\
+akt2 & 2/18 & 6/29 & 2/17 & 6/28 & 35 & 117 \\
+aldr & 1/1 & 2/1 & 1/1 & 2/1 & 14 & 159 \\
+ampc & 17/18 & 17/19 & 17/18 & 17/19 & 36 & 48 \\
+andr & 45/47 & 80/84 & 45/46 & 78/82 & 187 & 268 \\
+aofb & 6/7 & 9/15 & 6/7 & 9/14 & 31 & 122 \\
+bace1 & 49/50 & 83/99 & 48/49 & 78/94 & 211 & 283 \\
+braf & 43/46 & 53/73 & 42/46 & 52/72 & 77 & 152 \\
+cah2 & 8/9 & 11/10 & 8/9 & 11/10 & 40 & 492 \\
+casp3 & 16/18 & 29/31 & 16/18 & 29/31 & 119 & 199 \\
+cdk2 & 44/49 & 70/93 & 43/49 & 69/92 & 182 & 474 \\
+comt & 31/36 & 36/40 & 29/34 & 34/38 & 41 & 41 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{thebibliography}{99}
+\small
+
+\bibitem{bedroc}
+Jean-Fran\c{c}ois Truchon and Christopher I. Bayly.
+Evaluating virtual screening methods: Good and bad metrics for the ``early recognition'' problem.
+\emph{Journal of Chemical Information and Modeling}, 47(2):488--508, 2007.
+
+\bibitem{chen}
+Lieyang Chen, Anthony Cruz, Steven Ramsey, Callum J. Dickson, Jose S. Duca, Viktor Hornak, David R. Koes, and Tom Kurtzman.
+Hidden bias in the DUD-E dataset leads to misleading performance of deep learning in structure-based virtual screening.
+\emph{PLoS ONE}, 14(8):e0220113, 2019.
+doi: 10.1371/journal.pone.0220113.
+
+\bibitem{clip}
+Alec Radford, Jong Wook Kim, Chris Hallacy, Aditya Ramesh, Gabriel Goh, Sandhini Agarwal, Girish Sastry, Amanda Askell, Pamela Mishkin, Jack Clark, Gretchen Krueger, and Ilya Sutskever.
+Learning transferable visual models from natural language supervision.
+In \emph{International Conference on Machine Learning (ICML)}, 2021.
+
+\bibitem{colbert}
+Omar Khattab and Matei Zaharia.
+ColBERT: Efficient and effective passage search via contextualized late interaction over BERT.
+In \emph{Proceedings of the 43rd International ACM SIGIR Conference on Research and Development in Information Retrieval}, 2020.
+
+\bibitem{colbertv2}
+Keshav Santhanam, Omar Khattab, Jon Saad-Falcon, Christopher Potts, and Matei Zaharia.
+ColBERTv2: Effective and efficient retrieval via lightweight late interaction.
+In \emph{Proceedings of the 2022 Conference of the North American Chapter of the Association for Computational Linguistics (NAACL)}, 2022.
+
+\bibitem{drugclip}
+Bowen Gao, Bo Qiang, Haichuan Tan, Yinjun Jia, Minsi Ren, Minsi Lu, Jingjing Liu, Wei-Ying Ma, and Yanyan Lan.
+DrugCLIP: Contrastive protein-molecule representation learning for virtual screening.
+In \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2023.
+arXiv:2310.06367.
+
+\bibitem{dude}
+Michael M. Mysinger, Michael Carchia, John J. Irwin, and Brian K. Shoichet.
+Directory of useful decoys, enhanced (DUD-E): Better ligands and decoys for better benchmarking.
+\emph{Journal of Medicinal Chemistry}, 55(14):6582--6594, 2012.
+
+\bibitem{gnina}
+Andrew T. McNutt, Paul Francoeur, Rishal Aggarwal, Tomohide Masuda, Rocco Meli, Matthew Ragoza, Jocelyn Sunseri, and David Ryan Koes.
+GNINA 1.0: molecular docking with deep learning.
+\emph{Journal of Cheminformatics}, 13(1):43, 2021.
+
+\bibitem{litpcba}
+Viet-Khoa Tran-Nguyen, C\'eline Jacquemard, and Didier Rognan.
+LIT-PCBA: An unbiased data set for machine learning and virtual screening.
+\emph{Journal of Chemical Information and Modeling}, 60(9):4263--4273, 2020.
+doi: 10.1021/acs.jcim.0c00155.
+
+\bibitem{litpcbaaudit}
+Amber Huang, Ian Scott Knight, and Slava Naprienko.
+Data leakage and redundancy in the LIT-PCBA benchmark.
+arXiv preprint arXiv:2507.21404, 2025.
+
+\bibitem{plip}
+Sebastian Salentin, Sven Schreiber, V. Joachim Haupt, Melissa F. Adasme, and Michael Schroeder.
+PLIP: fully automated protein-ligand interaction profiler.
+\emph{Nucleic Acids Research}, 43(W1):W443--W447, 2015.
+doi: 10.1093/nar/gkv315.
+
+\bibitem{unimol}
+Gengmo Zhou, Zhifeng Gao, Qiankun Ding, Hang Zheng, Hongteng Xu, Zhewei Wei, Linfeng Zhang, and Guolin Ke.
+Uni-Mol: A universal 3D molecular representation learning framework.
+In \emph{International Conference on Learning Representations (ICLR)}, 2023.
+
+\end{thebibliography}
+
+\end{document}
